@@ -27,7 +27,7 @@ if (!RPC || !TOKEN || !MERCHANT) {
   process.exit(1);
 }
 if (!MASTER_PK) {
-  console.log("Incomplete env: MASTER_PK (needed for ENS subname registiration)");
+  console.log("Incomplete env: MASTER_PK (needed for ENS subname registration)");
   process.exit(1);
 }
 
@@ -51,7 +51,8 @@ const nameWrapperAbi = [
 const publicResolverAbi = [
   "function setAddr(bytes32 node, address a)",
   "function addr(bytes32 node) view returns (address)",
-  "function setText(bytes32 node, string key, string value)"
+  "function setText(bytes32 node, string key, string value)",
+  "function text(bytes32 node, string key) view returns (string)"
 ];
 
 const provider = new ethers.JsonRpcProvider(RPC);
@@ -61,6 +62,7 @@ const masterWallet = new ethers.Wallet(MASTER_PK, provider);
 const ens = new ethers.Contract(ENS_REGISTRY, ensRegistryAbi, provider);
 const wrapper = new ethers.Contract(NAMEWRAPPER, nameWrapperAbi, masterWallet);
 const resolver = new ethers.Contract(PUBLIC_RESOLVER, publicResolverAbi, masterWallet);
+
 const ensCache = new Set();
 
 function ensureRevokeFile() {
@@ -70,7 +72,6 @@ function ensureRevokeFile() {
     }
   } catch {}
 }
-
 function loadRevokedSet() {
   try {
     const j = JSON.parse(fs.readFileSync(REVOKE_FILE, "utf8"));
@@ -79,7 +80,6 @@ function loadRevokedSet() {
     return new Set();
   }
 }
-
 function isRevoked(uidHex) {
   return loadRevokedSet().has(uidHex.toUpperCase());
 }
@@ -93,35 +93,49 @@ function labelFromUid(uidHex) {
   return uidHex.toLowerCase();
 }
 
+function ensNameForUid(uidHex) {
+  return `${labelFromUid(uidHex)}.${PARENT_NAME}`;
+}
+
+async function setTextIfDifferent(node, key, value) {
+  try {
+    const cur = await resolver.text(node, key);
+    if (String(cur) === String(value)) return false;
+  } catch {
+  }
+  const tx = await resolver.setText(node, key, value);
+  await tx.wait();
+  return true;
+}
+
 async function ensureEnsSubname(uid, cardAddr) {
   const label = labelFromUid(uid);
-  if (ensCache.has(label)) return;
-
+  const subname = ensNameForUid(uid);
   const parentNode = ethers.namehash(PARENT_NAME);
-  const subname = `${label}.${PARENT_NAME}`;
   const node = ethers.namehash(subname);
 
   const parentData = await wrapper.getData(BigInt(parentNode)).catch(() => null);
   if (!parentData || parentData.expiry === 0n) {
-    throw new Error(
-      `Parent not wrapped or not valid in NameWrapper: ${PARENT_NAME}.`
-    );
+    throw new Error(`Parent not wrapped: ${PARENT_NAME}`);
   }
 
-  const currentOwner = await ens.owner(node);
-  if (currentOwner === ethers.ZeroAddress) {
-    console.log(`ENS: creating ${subname}`);
-    const tx1 = await wrapper.setSubnodeRecord(
-      parentNode,
-      label,
-      await masterWallet.getAddress(),
-      PUBLIC_RESOLVER,
-      0,
-      0,
-      parentData.expiry
-    );
-    console.log("ENS TX:", tx1.hash);
-    await tx1.wait();
+  if (!ensCache.has(label)) {
+    const currentOwner = await ens.owner(node);
+    if (currentOwner === ethers.ZeroAddress) {
+      console.log(`ENS: creating ${subname}`);
+      const tx1 = await wrapper.setSubnodeRecord(
+        parentNode,
+        label,
+        await masterWallet.getAddress(),
+        PUBLIC_RESOLVER,
+        0,
+        0,
+        parentData.expiry
+      );
+      console.log("ENS TX:", tx1.hash);
+      await tx1.wait();
+    }
+    ensCache.add(label);
   }
 
   const currentAddr = await resolver.addr(node).catch(() => ethers.ZeroAddress);
@@ -132,17 +146,19 @@ async function ensureEnsSubname(uid, cardAddr) {
     await tx2.wait();
   }
 
-  console.log(`ENS: setText uid/type/token/chain for ${subname}`);
-  const tx3 = await resolver.setText(node, "uid", uid.toUpperCase());
-  await tx3.wait();
-  const tx4 = await resolver.setText(node, "type", "emergency-cash");
-  await tx4.wait();
-  const tx5 = await resolver.setText(node, "token", "USDC");
-  await tx5.wait();
-  const tx6 = await resolver.setText(node, "chain", "sepolia");
-  await tx6.wait();
+  let wroteAny = false;
+  wroteAny = (await setTextIfDifferent(node, "uid", uid.toUpperCase())) || wroteAny;
+  wroteAny = (await setTextIfDifferent(node, "type", "emergency-cash")) || wroteAny;
+  wroteAny = (await setTextIfDifferent(node, "token", "USDC")) || wroteAny;
+  wroteAny = (await setTextIfDifferent(node, "chain", "sepolia")) || wroteAny;
 
-  ensCache.add(label);
+  if (wroteAny) {
+    console.log(`ENS: text records updated for ${subname}`);
+  } else {
+    console.log(`ENS: text records already OK for ${subname}`);
+  }
+
+  return { subname, node };
 }
 
 async function pay(fromWallet) {
@@ -152,14 +168,14 @@ async function pay(fromWallet) {
   const addr = await fromWallet.getAddress();
   const bal = await tokenRO.balanceOf(addr);
 
-  console.log(`BAL: ${ethers.formatUnits(bal, DECIMALS)} token`);
+  console.log(`BAL: ${ethers.formatUnits(bal, DECIMALS)} USDC`);
   if (bal < value) {
-    console.log(`Insufficient (need ${PRICE})`);
+    console.log(`Insufficient (need ${PRICE} USDC)`);
     console.log("----");
     return;
   }
 
-  console.log(`Sending ${PRICE} to merchant ${MERCHANT}`);
+  console.log(`Sending ${PRICE} USDC to merchant ${MERCHANT}`);
   const tx = await token.transfer(MERCHANT, value);
   console.log("TX:", tx.hash);
   console.log("waiting confirm...");
@@ -171,7 +187,7 @@ async function pay(fromWallet) {
 (async () => {
   ensureRevokeFile();
 
-  const sym = await tokenRO.symbol().catch(() => "TOKEN");
+  const sym = await tokenRO.symbol().catch(() => "USDC");
   const dec = await tokenRO.decimals().catch(() => DECIMALS);
 
   console.log(`POS PAY listening on ${PORT} @ ${BAUD}`);
@@ -197,7 +213,8 @@ async function pay(fromWallet) {
     if (!uid) return;
 
     if (isRevoked(uid)) {
-      console.log(`UID: ${uid}`);
+      console.log(`CARD: ${ensNameForUid(uid)}`);
+      console.log(`UID : ${uid}`);
       console.log("Revoked Card");
       console.log("----");
       return;
@@ -206,12 +223,13 @@ async function pay(fromWallet) {
     busy = true;
     try {
       const pk = uidToPrivateKey(uid);
-
       const sk = new SigningKey(pk);
       const addr = computeAddress(sk.publicKey);
+      const ensName = ensNameForUid(uid);
 
-      console.log(`UID: ${uid}`);
-      console.log(`ADR: ${addr}`);
+      console.log(`CARD: ${ensName}`);
+      console.log(`UID : ${uid}`);
+      console.log(`FROM: ${addr}`);
 
       await ensureEnsSubname(uid, addr);
 
