@@ -1,0 +1,60 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>EmergencyDigitalCash</title>
+  <style>
+    body{font-family:ui-sans-serif,system-ui;max-width:820px;margin:40px auto;padding:0 16px;line-height:1.55}
+    code{background:#f2f2f2;padding:2px 6px;border-radius:6px}
+    .card{border:1px solid #e7e7e7;border-radius:14px;padding:16px;margin:14px 0}
+    .muted{color:#666}
+    a{color:#0b57d0;text-decoration:none}
+    a:hover{text-decoration:underline}
+    .ok{color:green;font-weight:650}
+  </style>
+</head>
+<body>
+  <h1>EmergencyDigitalCash</h1>
+  <p class="muted">RFID/NFC card → ENS subname → USDC payment (Sepolia)</p>
+
+  <div class="card">
+    <h2>What is this?</h2>
+    <p>
+      A tap-to-pay “emergency cash” card built with a cheap RC522 reader + STM32F103Tx.
+      Each card UID deterministically maps to an EVM address. When tapped, the POS:
+      (1) provisions an ENS subname under <code>emergencycash-try.eth</code>,
+      (2) sets resolver records (addr + text),
+      (3) pays the merchant in USDC on Sepolia.
+    </p>
+  </div>
+
+  <div class="card">
+    <h2>How it works</h2>
+    <ol>
+      <li>RC522 reads <code>UID</code> from the card</li>
+      <li>POS derives card wallet address</li>
+      <li>Creates/updates ENS: <code>&lt;uid&gt;.emergencycash-try.eth</code></li>
+      <li>Writes ENS records: <code>addr</code>, <code>text(uid,type,token,chain,url)</code></li>
+      <li>Sends <code>PRICE</code> USDC to the merchant</li>
+    </ol>
+  </div>
+
+  <div class="card">
+    <h2>Demo checklist</h2>
+    <ul>
+      <li class="ok">✅ Tap card → prints UID + derived address</li>
+      <li class="ok">✅ ENS subname provisioned and records written</li>
+      <li class="ok">✅ USDC payment sent to merchant</li>
+      <li class="ok">✅ Lost-card safety: blocklist revoke/unrevoke</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h2>Repository</h2>
+    <p><a href="https://github.com/yigityektin/emergencydigitalcash">github.com/yigityektin/emergencydigitalcash</a></p>
+  </div>
+
+  <p class="muted">Built for a hackathon demo. Testnet only.</p>
+</body>
+</html>
