@@ -1,0 +1,15 @@
+# secrets
+.env
+.env.*
+
+# runtime data
+package-lock.json
+revoked_uids.json
+data/
+*.log
+
+# node
+node_modules/
+
+# macOS
+.DS_Store
