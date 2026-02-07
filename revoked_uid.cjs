@@ -1,4 +1,3 @@
-// revoke_uid.cjs
 const fs = require("node:fs");
 
 const file = process.env.REVOKE_FILE || "./revoked_uids.json";
