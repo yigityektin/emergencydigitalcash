@@ -15,11 +15,16 @@ const DECIMALS = Number(process.env.DECIMALS || 6);
 
 const MASTER_PK = process.env.MASTER_PK;
 const PARENT_NAME = process.env.PARENT_NAME || "emergencycash-try.eth";
+const APP_URL = process.env.APP_URL || "https://github.com/you/emergency-digital-cash";
 const REVOKE_FILE = process.env.REVOKE_FILE || "./revoked_uids.json";
+
+
+
 
 const ENS_REGISTRY = process.env.ENS_REGISTRY || "0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e";
 const NAMEWRAPPER  = process.env.ENS_NAMEWRAPPER || "0x0635513f179D50A207757E05759CbD106d7dFcE8";
 const PUBLIC_RESOLVER = process.env.ENS_PUBLIC_RESOLVER || "0xE99638b40E4Fff0129D56f03b55b6bbC4BBE49b5";
+const REVERSE_REGISTRAR = process.env.ENS_REVERSE_REGISTRAR || "0xa58E81fe9b61B5c3fE2AFD33CF304c454AbFc7Cb";
 
 if (!RPC || !TOKEN || !MERCHANT) {
   console.log("Incomplete env:");
@@ -40,7 +45,6 @@ const erc20Abi = [
 
 const ensRegistryAbi = [
   "function owner(bytes32 node) view returns (address)",
-  "function resolver(bytes32 node) view returns (address)"
 ];
 
 const nameWrapperAbi = [
@@ -55,6 +59,10 @@ const publicResolverAbi = [
   "function text(bytes32 node, string key) view returns (string)"
 ];
 
+const reverseRegistrarAbi = [
+  "function setName(string name) returns (bytes32)"
+];
+
 const provider = new ethers.JsonRpcProvider(RPC);
 const tokenRO = new ethers.Contract(TOKEN, erc20Abi, provider);
 
@@ -64,6 +72,7 @@ const wrapper = new ethers.Contract(NAMEWRAPPER, nameWrapperAbi, masterWallet);
 const resolver = new ethers.Contract(PUBLIC_RESOLVER, publicResolverAbi, masterWallet);
 
 const ensCache = new Set();
+const reverseCache = new Set();
 
 function ensureRevokeFile() {
   try {
@@ -72,6 +81,7 @@ function ensureRevokeFile() {
     }
   } catch {}
 }
+
 function loadRevokedSet() {
   try {
     const j = JSON.parse(fs.readFileSync(REVOKE_FILE, "utf8"));
@@ -80,6 +90,7 @@ function loadRevokedSet() {
     return new Set();
   }
 }
+
 function isRevoked(uidHex) {
   return loadRevokedSet().has(uidHex.toUpperCase());
 }
@@ -152,13 +163,35 @@ async function ensureEnsSubname(uid, cardAddr) {
   wroteAny = (await setTextIfDifferent(node, "token", "USDC")) || wroteAny;
   wroteAny = (await setTextIfDifferent(node, "chain", "sepolia")) || wroteAny;
 
-  if (wroteAny) {
-    console.log(`ENS: text records updated for ${subname}`);
-  } else {
-    console.log(`ENS: text records already OK for ${subname}`);
+  if (APP_URL) {
+    wroteAny = (await setTextIfDifferent(node, "url", APP_URL)) || wroteAny;
   }
 
+  if (wroteAny) console.log(`ENS: records updated for ${subname}`);
+  else console.log(`ENS: records already OK for ${subname}`);
+
   return { subname, node };
+}
+
+async function ensureReverseRecord(cardWallet, ensName) {
+  const cardAddr = await cardWallet.getAddress();
+  if (reverseCache.has(cardAddr.toLowerCase())) return;
+
+  const cur = await provider.lookupAddress(cardAddr).catch(() => null);
+  if (cur && cur.toLowerCase() === ensName.toLowerCase()) {
+    console.log(`Reverse: already OK (${cur})`);
+    reverseCache.add(cardAddr.toLowerCase());
+    return;
+  }
+
+  console.log(`Reverse: setting ${cardAddr} -> ${ensName}`);
+  const rr = new ethers.Contract(REVERSE_REGISTRAR, reverseRegistrarAbi, cardWallet);
+  const tx = await rr.setName(ensName);
+  console.log("Reverse TX:", tx.hash);
+  await tx.wait();
+
+  console.log("Reverse: setName OK");
+  reverseCache.add(cardAddr.toLowerCase());
 }
 
 async function pay(fromWallet) {
@@ -175,7 +208,7 @@ async function pay(fromWallet) {
     return;
   }
 
-  console.log(`Sending ${PRICE} USDC to merchant ${MERCHANT}`);
+  console.log(`Sending ${PRICE} USDC to merchant ${MERCHANT} ...`);
   const tx = await token.transfer(MERCHANT, value);
   console.log("TX:", tx.hash);
   console.log("waiting confirm...");
@@ -196,7 +229,9 @@ async function pay(fromWallet) {
   console.log(`ENS parent: ${PARENT_NAME}`);
   console.log(`ENS NameWrapper: ${NAMEWRAPPER}`);
   console.log(`ENS PublicResolver: ${PUBLIC_RESOLVER}`);
+  console.log(`ENS ReverseRegistrar: ${REVERSE_REGISTRAR}`);
   console.log(`Blocklist file: ${REVOKE_FILE}`);
+  if (APP_URL) console.log(`ENS url: ${APP_URL}`);
   console.log("Scan the card\n");
 
   const port = new SerialPort({ path: PORT, baudRate: BAUD });
@@ -212,8 +247,10 @@ async function pay(fromWallet) {
     const uid = line.slice("UID_RAW:".length).trim();
     if (!uid) return;
 
+    const ensName = ensNameForUid(uid);
+
     if (isRevoked(uid)) {
-      console.log(`CARD: ${ensNameForUid(uid)}`);
+      console.log(`CARD: ${ensName}`);
       console.log(`UID : ${uid}`);
       console.log("Revoked Card");
       console.log("----");
@@ -225,7 +262,6 @@ async function pay(fromWallet) {
       const pk = uidToPrivateKey(uid);
       const sk = new SigningKey(pk);
       const addr = computeAddress(sk.publicKey);
-      const ensName = ensNameForUid(uid);
 
       console.log(`CARD: ${ensName}`);
       console.log(`UID : ${uid}`);
@@ -233,8 +269,10 @@ async function pay(fromWallet) {
 
       await ensureEnsSubname(uid, addr);
 
-      const wallet = new ethers.Wallet(pk, provider);
-      await pay(wallet);
+      const cardWallet = new ethers.Wallet(pk, provider);
+      await ensureReverseRecord(cardWallet, ensName);
+
+      await pay(cardWallet);
     } catch (e) {
       console.error("Err:", e?.shortMessage || e?.message || e);
       console.log("----");
