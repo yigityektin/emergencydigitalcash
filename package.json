@@ -13,6 +13,7 @@
   "dependencies": {
     "@bgd-labs/aave-address-book": "^4.44.8",
     "ethers": "^6.16.0",
-    "serialport": "^13.0.0"
+    "serialport": "^13.0.0",
+    "solc": "^0.8.33"
   }
 }
