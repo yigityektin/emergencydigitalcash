@@ -14,25 +14,36 @@ const PRICE = process.env.PRICE || "1.0";
 const DECIMALS = Number(process.env.DECIMALS || 6);
 
 const MASTER_PK = process.env.MASTER_PK;
+const MASTER_SECRET = process.env.MASTER_SECRET;
 const PARENT_NAME = process.env.PARENT_NAME || "emergencycash-try.eth";
-const APP_URL = process.env.APP_URL || "https://github.com/you/emergency-digital-cash";
+const APP_URL = process.env.APP_URL || "";
 const REVOKE_FILE = process.env.REVOKE_FILE || "./revoked_uids.json";
-
-
-
+const SWEEP_TO_ADDR = process.env.SWEEP_TO_ADDR || MERCHANT;
 
 const ENS_REGISTRY = process.env.ENS_REGISTRY || "0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e";
 const NAMEWRAPPER  = process.env.ENS_NAMEWRAPPER || "0x0635513f179D50A207757E05759CbD106d7dFcE8";
 const PUBLIC_RESOLVER = process.env.ENS_PUBLIC_RESOLVER || "0xE99638b40E4Fff0129D56f03b55b6bbC4BBE49b5";
+
 const REVERSE_REGISTRAR = process.env.ENS_REVERSE_REGISTRAR || "0xa58E81fe9b61B5c3fE2AFD33CF304c454AbFc7Cb";
 
 if (!RPC || !TOKEN || !MERCHANT) {
   console.log("Incomplete env:");
-  console.log("RPC_URL=... TOKEN_ADDR=... MERCHANT_ADDR=... MASTER_PK=... PRICE=1.0 DECIMALS=6 node pos_pay.cjs <SERIAL_PORT>");
+  console.log("RPC_URL=... TOKEN_ADDR=... MERCHANT_ADDR=... MASTER_PK=... MASTER_SECRET=... PRICE=1.0 DECIMALS=6 node pos_pay.cjs <SERIAL_PORT>");
   process.exit(1);
 }
+
 if (!MASTER_PK) {
   console.log("Incomplete env: MASTER_PK (needed for ENS subname registration)");
+  process.exit(1);
+}
+
+if (!MASTER_SECRET) {
+  console.log("Incomplete env: MASTER_SECRET (needed for UID->PK derivation)");
+  process.exit(1);
+}
+
+if (!ethers.isAddress(SWEEP_TO_ADDR)) {
+  console.log("Incomplete/wrong env: SWEEP_TO_ADDR");
   process.exit(1);
 }
 
@@ -73,6 +84,7 @@ const resolver = new ethers.Contract(PUBLIC_RESOLVER, publicResolverAbi, masterW
 
 const ensCache = new Set();
 const reverseCache = new Set();
+const sweptCache = new Set();
 
 function ensureRevokeFile() {
   try {
@@ -96,8 +108,18 @@ function isRevoked(uidHex) {
 }
 
 // UID -> PK/ADDR
+function secretBytes() {
+  if (MASTER_SECRET.startsWith("0x") && MASTER_SECRET.length === 66) {
+    return ethers.getBytes(MASTER_SECRET);
+  }
+  return toUtf8Bytes(MASTER_SECRET);
+}
+
+// keccak(MASTER_SECRET_BYTES || uidLowerUtf8)
 function uidToPrivateKey(uidHex) {
-  return keccak256(toUtf8Bytes(uidHex.toLowerCase()));
+  const uidBytes = toUtf8Bytes(uidHex.toLowerCase());
+  const material = ethers.concat([secretBytes(), uidBytes]);
+  return keccak256(material);
 }
 
 function labelFromUid(uidHex) {
@@ -112,8 +134,7 @@ async function setTextIfDifferent(node, key, value) {
   try {
     const cur = await resolver.text(node, key);
     if (String(cur) === String(value)) return false;
-  } catch {
-  }
+  } catch {}
   const tx = await resolver.setText(node, key, value);
   await tx.wait();
   return true;
@@ -162,10 +183,7 @@ async function ensureEnsSubname(uid, cardAddr) {
   wroteAny = (await setTextIfDifferent(node, "type", "emergency-cash")) || wroteAny;
   wroteAny = (await setTextIfDifferent(node, "token", "USDC")) || wroteAny;
   wroteAny = (await setTextIfDifferent(node, "chain", "sepolia")) || wroteAny;
-
-  if (APP_URL) {
-    wroteAny = (await setTextIfDifferent(node, "url", APP_URL)) || wroteAny;
-  }
+  if (APP_URL) wroteAny = (await setTextIfDifferent(node, "url", APP_URL)) || wroteAny;
 
   if (wroteAny) console.log(`ENS: records updated for ${subname}`);
   else console.log(`ENS: records already OK for ${subname}`);
@@ -189,9 +207,39 @@ async function ensureReverseRecord(cardWallet, ensName) {
   const tx = await rr.setName(ensName);
   console.log("Reverse TX:", tx.hash);
   await tx.wait();
-
   console.log("Reverse: setName OK");
   reverseCache.add(cardAddr.toLowerCase());
+}
+
+async function sweepRevoked(uid, pk, cardAddr) {
+  const uidU = uid.toUpperCase();
+  if (sweptCache.has(uidU)) return;
+
+  try {
+    const bal = await tokenRO.balanceOf(cardAddr);
+    const human = ethers.formatUnits(bal, DECIMALS);
+
+    if (bal === 0n) {
+      console.log(`Sweep: no balance to sweep (0 ${human})`);
+      sweptCache.add(uidU);
+      return;
+    }
+
+    console.log(`Sweep: revoked card has ${human} USDC`);
+    console.log(`Sweep: sending all to ${SWEEP_TO_ADDR}`);
+
+    const cardWallet = new ethers.Wallet(pk, provider);
+    const token = tokenRO.connect(cardWallet);
+
+    const tx = await token.transfer(SWEEP_TO_ADDR, bal);
+    console.log("Sweep TX:", tx.hash);
+    console.log("waiting confirm...");
+    await tx.wait();
+    console.log("Sweeped");
+    sweptCache.add(uidU);
+  } catch (e) {
+    console.log("Sweep failed:", e?.shortMessage || e?.message || e);
+  }
 }
 
 async function pay(fromWallet) {
@@ -208,10 +256,10 @@ async function pay(fromWallet) {
     return;
   }
 
-  console.log(`Sending ${PRICE} USDC to merchant ${MERCHANT} ...`);
+  console.log(`Sending ${PRICE} USDC to merchant ${MERCHANT}`);
   const tx = await token.transfer(MERCHANT, value);
   console.log("TX:", tx.hash);
-  console.log("waiting confirm...");
+  console.log("waiting confirm");
   await tx.wait();
   console.log("Paid");
   console.log("----");
@@ -226,6 +274,7 @@ async function pay(fromWallet) {
   console.log(`POS PAY listening on ${PORT} @ ${BAUD}`);
   console.log(`Token: ${sym} ${TOKEN} | Price: ${PRICE} | decimals=${dec}`);
   console.log(`Merchant: ${MERCHANT}`);
+  console.log(`Sweep to: ${SWEEP_TO_ADDR}`);
   console.log(`ENS parent: ${PARENT_NAME}`);
   console.log(`ENS NameWrapper: ${NAMEWRAPPER}`);
   console.log(`ENS PublicResolver: ${PUBLIC_RESOLVER}`);
@@ -249,14 +298,6 @@ async function pay(fromWallet) {
 
     const ensName = ensNameForUid(uid);
 
-    if (isRevoked(uid)) {
-      console.log(`CARD: ${ensName}`);
-      console.log(`UID : ${uid}`);
-      console.log("Revoked Card");
-      console.log("----");
-      return;
-    }
-
     busy = true;
     try {
       const pk = uidToPrivateKey(uid);
@@ -266,6 +307,13 @@ async function pay(fromWallet) {
       console.log(`CARD: ${ensName}`);
       console.log(`UID : ${uid}`);
       console.log(`FROM: ${addr}`);
+
+      if (isRevoked(uid)) {
+        console.log("Revoked Card (payment blocked)");
+        await sweepRevoked(uid, pk, addr);
+        console.log("----");
+        return;
+      }
 
       await ensureEnsSubname(uid, addr);
 
